@@ -38,25 +38,42 @@
 M5Canvas canvas(&M5Cardputer.Display);
 Moonraker mr;
 
-enum class Screen { DASH, TEMP, MOVE, FILES, MACROS, LOG };
+// webcam defaults — override in secrets.h if your cam differs
+#ifndef WEBCAM_PORT
+#define WEBCAM_PORT 8080
+#endif
+#ifndef WEBCAM_PATH
+#define WEBCAM_PATH "/stream"
+#endif
+
+// OBJECTS ('7') and WEBCAM ('8') live off the tab bar — DASH-family views
+enum class Screen { DASH, TEMP, MOVE, FILES, MACROS, LOG, OBJECTS, WEBCAM };
 Screen screen = Screen::DASH;
 
 uint32_t lastDrawMs = 0, lastHistMs = 0;
 
 // ── confirm modal ────────────────────────────────────────────────────────
-enum class Act { NONE, CANCEL_PRINT, ESTOP, START_PRINT, FW_RESTART, HOST_RESTART };
+// Anything that can wreck an active print sits behind one of these:
+// cancel, e-stop, pause/resume, mid-print temp changes, exclude object.
+enum class Act { NONE, CANCEL_PRINT, ESTOP, START_PRINT, FW_RESTART, HOST_RESTART,
+                 PAUSE, RESUME, SET_TEMP, EXCLUDE_OBJ };
 struct {
     bool active = false;
     Act act = Act::NONE;
     String l1, l2, arg;
+    int argA = 0;
+    float argB = 0;
 } modal;
 
-void openConfirm(Act a, const String &l1, const String &l2, const String &arg = "") {
+void openConfirm(Act a, const String &l1, const String &l2, const String &arg = "",
+                 int argA = 0, float argB = 0) {
     modal.active = true;
     modal.act = a;
     modal.l1 = l1;
     modal.l2 = l2;
     modal.arg = arg;
+    modal.argA = argA;
+    modal.argB = argB;
 }
 
 // ── beep melodies (speaker only — non-blocking note queue) ──────────────
@@ -171,11 +188,81 @@ int   presetIdx = -1;
 struct Preset { const char *name; int noz, bed; };
 const Preset PRESETS[] = {{"PLA", 210, 60}, {"PETG", 240, 80}, {"ABS", 250, 100}, {"OFF", 0, 0}};
 
-// DASH tune row (speed/flow/fan %) — debounced sends
+// DASH tune row (speed/flow/fan % + Z-offset babystep) — debounced sends
 int      tuneSel = 0;
 float    pendTune[3] = {100, 100, 0};
 bool     tuneDirty[3] = {false, false, false};
 uint32_t lastTuneAdjMs = 0;
+// Z babystep accumulates locally, then one SET_GCODE_OFFSET Z_ADJUST per
+// debounce window — 0.005mm per step, hold-to-ramp for bigger moves
+float    zAdjPending = 0;
+bool     zDirty = false;
+
+// OBJECTS (screen 7) — exclude-object plate map
+int  objSel = 0, objTop = 0;
+bool objectsPending = false;
+
+// WEBCAM (screen 8) — grabs JPEG frames straight out of the MJPEG stream
+WiFiClient camClient;
+uint8_t   *camBuf = nullptr;
+size_t     camFill = 0, camScanned = 0;
+int        camSoi = -1;
+bool       camFrameShown = false;
+uint32_t   camLastFrameMs = 0;
+int        camFps10 = 0;
+const size_t CAM_BUF_SIZE = 56 * 1024;   // biggest frame accepted — no PSRAM on this unit
+
+void camStop() {
+    camClient.stop();
+    if (camBuf) { free(camBuf); camBuf = nullptr; }
+    camFill = camScanned = 0;
+    camSoi = -1;
+    camFrameShown = false;
+    camLastFrameMs = 0;
+}
+
+bool camStart() {
+    camStop();
+    camBuf = (uint8_t *)malloc(CAM_BUF_SIZE);
+    if (!camBuf) return false;
+    if (!camClient.connect(MOONRAKER_HOST, WEBCAM_PORT)) { camStop(); return false; }
+    camClient.print(String("GET ") + WEBCAM_PATH + " HTTP/1.1\r\nHost: " MOONRAKER_HOST "\r\n\r\n");
+    return true;
+}
+
+// Called every loop() while on the webcam screen: reads a slice of the
+// stream, and when a complete FFD8..FFD9 JPEG is in the buffer, decodes
+// it into the canvas (drawCurrent pushes it). HTTP/multipart headers pass
+// through the scanner harmlessly — they never contain the SOI marker.
+void camLoop() {
+    if (!camBuf || !camClient.connected()) return;
+    int n = camClient.read(camBuf + camFill, min((size_t)4096, CAM_BUF_SIZE - camFill));
+    if (n > 0) camFill += n;
+    for (size_t i = camScanned; i + 1 < camFill; i++) {
+        if (camBuf[i] == 0xFF && camBuf[i + 1] == 0xD8) {
+            camSoi = (int)i;
+        } else if (camBuf[i] == 0xFF && camBuf[i + 1] == 0xD9 && camSoi >= 0) {
+            canvas.fillRect(0, 13, SCR_W, SCR_H - 13, TFT_BLACK);
+            canvas.drawJpg(camBuf + camSoi, (i + 2) - camSoi, 0, 13, SCR_W, SCR_H - 23,
+                           0, 0, 0.0f, 0.0f);   // zoom 0 = auto-fit to maxWidth/maxHeight
+            camFrameShown = true;
+            uint32_t now = millis();
+            if (camLastFrameMs) camFps10 = (int)(10000UL / max(now - camLastFrameMs, (uint32_t)1));
+            camLastFrameMs = now;
+            size_t tail = camFill - (i + 2);
+            memmove(camBuf, camBuf + i + 2, tail);
+            camFill = tail;
+            camScanned = 0;
+            camSoi = -1;
+            return;   // one frame per pass
+        }
+    }
+    camScanned = camFill > 0 ? camFill - 1 : 0;
+    if (camFill >= CAM_BUF_SIZE - 4096) {   // overrun without a frame — resync
+        camFill = camScanned = 0;
+        camSoi = -1;
+    }
+}
 
 // MOVE
 const float STEPS[] = {0.1f, 1.0f, 10.0f, 25.0f};
@@ -214,38 +301,40 @@ void showToast(const String &msg, uint16_t color, uint32_t ms) {
     toastUntil = millis() + ms;
 }
 
+// Fixed-width box (no per-frame width changes — the old dynamic width
+// pulsed when the busy dots animated), lines centered, guaranteed
+// word-wrap to two lines. 31 chars/line leaves room for 3 busy dots.
 void drawToast() {
     if (millis() >= toastUntil) return;
+    const int CPL = 31;
     String t = toastMsg;
-    // animated dots while the tracked gcode is still executing
-    if (mr.gcodeBusy) {
-        int dots = (millis() / 300) % 4;
-        for (int i = 0; i < dots; i++) t += '.';
-    }
-    // wrap to two lines at a word boundary instead of truncating
     String l1 = t, l2 = "";
-    if ((int)t.length() > 36) {
-        int cut = 36;
-        for (int i = 36; i > 16; i--) if (t[i] == ' ') { cut = i; break; }
+    if ((int)t.length() > CPL) {
+        int cut = CPL;
+        for (int i = CPL; i > 12; i--) if (t.charAt(i) == ' ') { cut = i; break; }
         l1 = t.substring(0, cut);
-        l2 = t.substring(t[cut] == ' ' ? cut + 1 : cut);
-        if ((int)l2.length() > 36) l2 = l2.substring(0, 33) + "...";
+        l2 = t.substring(t.charAt(cut) == ' ' ? cut + 1 : cut);
+        if ((int)l2.length() > CPL) l2 = l2.substring(0, CPL - 2) + "..";
     }
-    int wchars = max((int)l1.length(), (int)l2.length());
-    int w = wchars * 6 + 16;
-    int h = l2.length() ? 26 : 16;
+    int w = SCR_W - 8, x = 4;
+    int h = l2.length() ? 28 : 18;
     // console keeps its input line at the bottom — toast moves up top there
-    int x = (SCR_W - w) / 2;
-    int y = (screen == Screen::LOG) ? 16 : SCR_H - 14 - h;
+    int y = (screen == Screen::LOG) ? 15 : SCR_H - 12 - h;
     canvas.fillRoundRect(x, y, w, h, 3, C_PANEL);
     canvas.drawRoundRect(x, y, w, h, 3, toastColor);
     canvas.setTextSize(1);
     canvas.setTextColor(toastColor);
-    canvas.setCursor(x + 8, y + 4);
+    canvas.setCursor(x + (w - (int)l1.length() * 6) / 2, y + 5);
     canvas.print(l1);
     if (l2.length()) {
-        canvas.setCursor(x + 8, y + 14);
+        canvas.setCursor(x + (w - (int)l2.length() * 6) / 2, y + 15);
         canvas.print(l2);
+    }
+    // animated dots while the tracked gcode is still executing — appended
+    // after the last line so the box itself never changes size
+    if (mr.gcodeBusy) {
+        int dots = (millis() / 300) % 4;
+        for (int i = 0; i < dots; i++) canvas.print('.');
     }
 }
 
@@ -264,6 +353,8 @@ uint16_t connDotColor() {
 }
 
 void switchScreen(Screen s) {
+    if (screen == Screen::WEBCAM && s != Screen::WEBCAM) camStop();
+    bool enteringCam = (s == Screen::WEBCAM && screen != Screen::WEBCAM);
     screen = s;
     homeMenu = restartMenu = fileDetail = false;
     consoleInput = false;
@@ -271,6 +362,8 @@ void switchScreen(Screen s) {
     logScroll = 0;
     if (s == Screen::FILES && !mr.filesLoaded) filesPending = true;
     if (s == Screen::MACROS && !mr.macrosLoaded && mr.wsUp) mr.requestMacros();
+    if (s == Screen::OBJECTS) objectsPending = true;   // refresh every entry — objects change per job
+    if (enteringCam && !camStart()) showToast("webcam connect failed", C_ERR, 3000);
 }
 
 void goBack() {
@@ -278,7 +371,13 @@ void goBack() {
     if (homeMenu)    { homeMenu = false; return; }
     if (restartMenu) { restartMenu = false; return; }
     if (fileDetail)  { fileDetail = false; return; }
-    screen = Screen::DASH;
+    if (screen != Screen::DASH) switchScreen(Screen::DASH);   // via switchScreen so the webcam socket closes
+}
+
+void doSetTemp(int heater, int t) {
+    mr.sendGcode(heater == 0 ? "M104 S" + String(t) : "M140 S" + String(t));
+    tempDirty[heater] = false;
+    chirpAck();
 }
 
 void execConfirm() {
@@ -290,8 +389,28 @@ void execConfirm() {
         case Act::START_PRINT:  mr.startPrint(modal.arg); switchScreen(Screen::DASH); break;
         case Act::FW_RESTART:   mr.firmwareRestart(); break;
         case Act::HOST_RESTART: mr.hostRestart(); break;
+        case Act::PAUSE:        mr.pausePrint(); break;
+        case Act::RESUME:       mr.resumePrint(); break;
+        case Act::SET_TEMP:     doSetTemp(modal.argA, (int)modal.argB); break;
+        case Act::EXCLUDE_OBJ:
+            mr.sendGcode("EXCLUDE_OBJECT NAME=" + modal.arg);
+            showToast("excluded: " + modal.arg, C_WARN, 2500);
+            break;
         default: break;
     }
+}
+
+// Mid-print temp changes go through a confirm — an accidental target
+// change during a running job is a print-killer. Idle/paused sends stay
+// immediate.
+void requestTempSend(int heater) {
+    int t = (int)pendTemp[heater];
+    if (mr.st.printState == "printing")
+        openConfirm(Act::SET_TEMP,
+                    String(heater == 0 ? "NOZZLE" : "BED") + " -> " + String(t) + "C MID-PRINT?",
+                    "confirm temp change during the job", "", heater, (float)t);
+    else
+        doSetTemp(heater, t);
 }
 
 void jog(char axis, float dist) {
@@ -324,13 +443,6 @@ void doHome(int sel) {
     static const char *cmds[] = {"G28", "G28 X", "G28 Y", "G28 Z"};
     if (mr.st.printState == "printing") { mr.pushLog("!! motion locked while printing", 1); chirpWarn(); return; }
     mr.sendGcode(cmds[sel]);
-}
-
-void sendTempTarget(int heater) {
-    int t = (int)pendTemp[heater];
-    mr.sendGcode(heater == 0 ? "M104 S" + String(t) : "M140 S" + String(t));
-    tempDirty[heater] = false;
-    chirpAck();
 }
 
 void applyPreset() {
@@ -405,6 +517,13 @@ void flushTune() {
     if (tuneDirty[0]) { mr.sendGcode("M220 S" + String((int)pendTune[0])); tuneDirty[0] = false; }
     if (tuneDirty[1]) { mr.sendGcode("M221 S" + String((int)pendTune[1])); tuneDirty[1] = false; }
     if (tuneDirty[2]) { mr.sendGcode("M106 S" + String((int)roundf(pendTune[2] * 2.55f))); tuneDirty[2] = false; }
+    if (zDirty) {
+        char b[56];
+        snprintf(b, sizeof(b), "SET_GCODE_OFFSET Z_ADJUST=%.3f MOVE=1", zAdjPending);
+        mr.sendGcode(b);
+        zAdjPending = 0;
+        zDirty = false;
+    }
 }
 
 // ═══ drawing ═════════════════════════════════════════════════════════════
@@ -492,29 +611,34 @@ void drawDash() {
     canvas.printf("Z %.2f", mr.st.posZ);
     if (mr.st.m117.length()) drawMarquee(110, 96, 126, mr.st.m117, C_ACCENT);
 
-    // tune row — selectable while a job is active
-    static const char *tl[3] = {"SPD", "FLW", "FAN"};
+    // tune row — S/F/FAN % + live Z-offset babystep, selectable while active
     int tx = 2;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         bool sel = active && i == tuneSel;
+        bool dirty = (i < 3) ? tuneDirty[i] : zDirty;
         char buf[16];
-        snprintf(buf, sizeof(buf), "%s %3.0f%%", tl[i], pendTune[i]);
+        switch (i) {
+            case 0: snprintf(buf, sizeof(buf), "S%3.0f%%", pendTune[0]); break;
+            case 1: snprintf(buf, sizeof(buf), "F%3.0f%%", pendTune[1]); break;
+            case 2: snprintf(buf, sizeof(buf), "FAN%3.0f%%", pendTune[2]); break;
+            case 3: snprintf(buf, sizeof(buf), "Z%+.3f", mr.st.zOffset + zAdjPending); break;
+        }
         int w = strlen(buf) * 6 + 8;
         if (sel) {
             canvas.fillRoundRect(tx, 106, w, 12, 2, C_PANEL);
             canvas.drawRoundRect(tx, 106, w, 12, 2, C_ACCENT);
         }
-        canvas.setTextColor(tuneDirty[i] ? C_WARN : (sel ? C_TEXT : C_DIM));
+        canvas.setTextColor(dirty ? C_WARN : (sel ? C_TEXT : C_DIM));
         canvas.setCursor(tx + 4, 108);
         canvas.print(buf);
-        tx += w + 8;
+        tx += w + 6;
     }
 
     if (active)
-        drawLegend(mr.st.printState == "paused" ? "[p]resume [c]ncl [x]stop [;.]sel [,/]adj"
-                                                : "[p]ause [c]ncl [x]stop [;.]sel [,/]adj");
+        drawLegend(mr.st.printState == "paused" ? "[p]resume [c]ncl [x]stop [;.][,/]tune+Z"
+                                                : "[p]ause [c]ncl [x]stop [;.][,/]tune+Z");
     else
-        drawLegend("[4]files start a print  [x]stop  [0]help");
+        drawLegend("[4]files [7]objects [8]cam [0]help");
 }
 
 void drawTemp() {
@@ -757,15 +881,19 @@ void drawHelp() {
     canvas.fillRoundRect(4, 2, SCR_W - 8, SCR_H - 4, 4, C_PANEL);
     canvas.drawRoundRect(4, 2, SCR_W - 8, SCR_H - 4, 4, C_ACCENT);
     canvas.setTextSize(1);
+    // every description <= 29 chars: text starts at x=52 and the box's
+    // inner edge is ~230px, so 52 + 29*6 = 226 is the hard fit limit —
+    // longer rows wrap-smeared across the overlay on real hardware
     struct { const char *k, *d; } rows[] = {
-        {"1-6",    "switch screens (works anywhere)"},
-        {"h ESC",  "back / close"},
-        {";/.",    "navigate    ,//  adjust (hold)"},
-        {"DASH",   "p pause  c cancel  x e-stop"},
-        {"TEMP",   "e type  0 off  p presets  ENT send"},
-        {"MOVE",   "wasd+;. jog  t step  g home"},
-        {"FILE",   "ENT open/print  r refresh"},
-        {"MACR",   "ENT run   CONS: ENT type cmd"},
+        {"1-6",   "screens  7 objects  8 webcam"},
+        {"h ESC", "back / close"},
+        {";/.",   "navigate  ,// adjust (hold)"},
+        {"DASH",  "p pause c cancel x e-stop"},
+        {"Z",     "tune row babysteps z-offset"},
+        {"TEMP",  "e type  0 off  ENT send"},
+        {"MOVE",  "wasd+;. jog  t step  g home"},
+        {"FILE",  "ENT print   MACR: ENT run"},
+        {"OBJ",   "ENT exclude  CONS: ENT cmd"},
     };
     canvas.setTextColor(C_ACCENT);
     canvas.setCursor(12, 8);
@@ -773,8 +901,8 @@ void drawHelp() {
     canvas.setTextColor(C_FAINT);
     canvas.setCursor(160, 8);
     canvas.print("[0] help");
-    for (int i = 0; i < 8; i++) {
-        int y = 22 + i * 12;
+    for (int i = 0; i < 9; i++) {
+        int y = 20 + i * 11;
         canvas.setTextColor(C_WARN);
         canvas.setCursor(12, y);
         canvas.print(rows[i].k);
@@ -785,6 +913,103 @@ void drawHelp() {
     canvas.setTextColor(C_FAINT);
     canvas.setCursor(60, SCR_H - 14);
     canvas.print("press any key to close");
+}
+
+// exclude-object plate map — list left, scaled bed right (AD5M: 220x220)
+void drawObjects() {
+    canvas.fillScreen(C_BG);
+    drawTopBar(-1, connDotColor());
+    canvas.setTextSize(1);
+    canvas.setTextColor(C_ACCENT);
+    canvas.setCursor(4, 15);
+    canvas.print("PRINT OBJECTS");
+
+    if (!mr.objectsLoaded || mr.objects.empty()) {
+        canvas.setTextColor(C_DIM);
+        canvas.setCursor(8, 40);
+        canvas.print("no object data");
+        drawWrapped(8, 54, SCR_W - 16,
+                    "objects appear once a job with exclude_object markers is printing",
+                    C_FAINT, 3);
+        drawLegend("[r]efresh  [ESC/h]back");
+        return;
+    }
+
+    int n = (int)mr.objects.size();
+    canvas.setTextColor(C_DIM);
+    canvas.setCursor(100, 15);
+    canvas.printf("%d obj  %d excl", n, (int)mr.st.excludedObjects.size());
+
+    const int ROWS = 7;
+    if (objSel < objTop) objTop = objSel;
+    if (objSel >= objTop + ROWS) objTop = objSel - ROWS + 1;
+    for (int r = 0; r < ROWS; r++) {
+        int idx = objTop + r;
+        if (idx >= n) break;
+        int y = 27 + r * 13;
+        bool sel = idx == objSel;
+        bool exc = mr.st.isExcluded(mr.objects[idx].name);
+        bool cur = mr.objects[idx].name == mr.st.currentObject && mr.st.currentObject.length();
+        if (sel) canvas.fillRoundRect(0, y - 2, 130, 13, 2, C_PANEL);
+        canvas.setTextColor(exc ? C_ERR : (cur ? C_OK : (sel ? C_TEXT : C_DIM)));
+        canvas.setCursor(4, y);
+        canvas.print(exc ? "X " : (cur ? "> " : "  "));
+        String name = mr.objects[idx].name;
+        if (name.length() > 19) name = name.substring(0, 18) + "~";
+        canvas.print(name);
+    }
+
+    // bed map — y flipped so the bed front is at the bottom of the screen
+    const int bx = 136, by = 17, bs = 96;
+    canvas.drawRect(bx, by, bs, bs, C_BORDER);
+    for (int i = 0; i < n; i++) {
+        const ObjEntry &o = mr.objects[i];
+        if (o.cx < 0) continue;
+        int px = bx + (int)(constrain(o.cx, 0.0f, 220.0f) / 220.0f * (bs - 1));
+        int py = by + bs - 1 - (int)(constrain(o.cy, 0.0f, 220.0f) / 220.0f * (bs - 1));
+        bool exc = mr.st.isExcluded(o.name);
+        bool cur = o.name == mr.st.currentObject && mr.st.currentObject.length();
+        if (exc) {
+            canvas.drawLine(px - 3, py - 3, px + 3, py + 3, C_ERR);
+            canvas.drawLine(px - 3, py + 3, px + 3, py - 3, C_ERR);
+        } else if (cur) {
+            canvas.fillCircle(px, py, 3, C_OK);
+        } else {
+            canvas.drawCircle(px, py, 2, C_DIM);
+        }
+        if (i == objSel) canvas.drawCircle(px, py, 5, C_ACCENT);
+    }
+    canvas.setTextColor(C_FAINT);
+    canvas.setCursor(bx + 20, by + bs + 2);
+    canvas.print("bed 220x220");
+
+    drawLegend("[;.]sel [ENT]exclude [r]efresh");
+}
+
+void drawWebcam() {
+    // no fillScreen — the canvas keeps the last decoded video frame;
+    // camLoop() paints new frames in as they finish decoding
+    if (!camFrameShown) {
+        canvas.fillScreen(C_BG);
+        canvas.setTextSize(1);
+        canvas.setTextColor(camClient.connected() ? C_DIM : C_ERR);
+        canvas.setCursor(30, 55);
+        canvas.print(camClient.connected() ? "waiting for first frame..." : "stream not connected");
+        canvas.setTextColor(C_FAINT);
+        canvas.setCursor(30, 70);
+        canvas.printf("%s:%d%s", MOONRAKER_HOST, WEBCAM_PORT, WEBCAM_PATH);
+    }
+    drawTopBar(-1, connDotColor());
+    canvas.fillRect(0, SCR_H - 10, SCR_W, 10, C_BAR);
+    canvas.setTextSize(1);
+    canvas.setTextColor(C_DIM);
+    canvas.setCursor(2, SCR_H - 9);
+    if (camClient.connected() && camFrameShown)
+        canvas.printf("WEBCAM  %d.%d fps   [ESC/h]back", camFps10 / 10, camFps10 % 10);
+    else if (camClient.connected())
+        canvas.print("WEBCAM  connecting...   [ESC/h]back");
+    else
+        canvas.print("WEBCAM  no stream   [r]etry [ESC]back");
 }
 
 void drawLoadingFrame(const char *msg) {
@@ -801,12 +1026,14 @@ void drawLoadingFrame(const char *msg) {
 
 void drawCurrent() {
     switch (screen) {
-        case Screen::DASH:   drawDash(); break;
-        case Screen::TEMP:   drawTemp(); break;
-        case Screen::MOVE:   drawMove(); break;
-        case Screen::FILES:  drawFiles(); break;
-        case Screen::MACROS: drawMacros(); break;
-        case Screen::LOG:    drawLog(); break;
+        case Screen::DASH:    drawDash(); break;
+        case Screen::TEMP:    drawTemp(); break;
+        case Screen::MOVE:    drawMove(); break;
+        case Screen::FILES:   drawFiles(); break;
+        case Screen::MACROS:  drawMacros(); break;
+        case Screen::LOG:     drawLog(); break;
+        case Screen::OBJECTS: drawObjects(); break;
+        case Screen::WEBCAM:  drawWebcam(); break;
     }
     // Overlays composite into the SAME frame, then ONE pushSprite per
     // frame. v1.2's screens pushed first and overlays pushed a second
@@ -826,7 +1053,16 @@ void drawCurrent() {
 void screenEnter() {
     switch (screen) {
         case Screen::TEMP:
-            sendTempTarget(tempSel);
+            requestTempSend(tempSel);
+            break;
+        case Screen::OBJECTS:
+            if (mr.objectsLoaded && objSel < (int)mr.objects.size()) {
+                const String &name = mr.objects[objSel].name;
+                if (!mr.st.isActive()) showToast("no active print", C_WARN, 2000);
+                else if (mr.st.isExcluded(name)) showToast("already excluded", C_WARN, 2000);
+                else openConfirm(Act::EXCLUDE_OBJ, "EXCLUDE THIS OBJECT?",
+                                 name + " - skipped for the rest of the job", name);
+            }
             break;
         case Screen::MOVE:
             if (homeMenu) { doHome(homeSel); homeMenu = false; }
@@ -876,8 +1112,12 @@ void handleDashKeys(char key) {
     bool active = mr.st.isActive();
     switch (key) {
         case 'p':
-            if (mr.st.printState == "printing") mr.pausePrint();
-            else if (mr.st.printState == "paused") mr.resumePrint();
+            // both directions confirmed — an accidental pause mid-print or
+            // an accidental resume of a deliberately-paused job both hurt
+            if (mr.st.printState == "printing")
+                openConfirm(Act::PAUSE, "PAUSE THIS PRINT?", mr.st.filename);
+            else if (mr.st.printState == "paused")
+                openConfirm(Act::RESUME, "RESUME PRINT?", mr.st.filename);
             break;
         case 'c':
             if (active) openConfirm(Act::CANCEL_PRINT, "CANCEL THIS PRINT?", mr.st.filename);
@@ -885,8 +1125,17 @@ void handleDashKeys(char key) {
         case 'x':
             openConfirm(Act::ESTOP, "EMERGENCY STOP?", "klipper will shut down");
             break;
-        case ';': if (active) tuneSel = (tuneSel + 2) % 3; break;
-        case '.': if (active) tuneSel = (tuneSel + 1) % 3; break;
+        case ';': if (active) tuneSel = (tuneSel + 3) % 4; break;
+        case '.': if (active) tuneSel = (tuneSel + 1) % 4; break;
+    }
+}
+
+void handleObjectsKeys(char key) {
+    int n = (int)mr.objects.size();
+    switch (key) {
+        case ';': if (n) objSel = (objSel + n - 1) % n; break;
+        case '.': if (n) objSel = (objSel + 1) % n; break;
+        case 'r': objectsPending = true; break;
     }
 }
 
@@ -895,8 +1144,19 @@ void handleTempKeys(char key) {
         case ';': tempSel = 1 - tempSel; break;
         case '.': tempSel = 1 - tempSel; break;
         case 'e': startEdit(&pendTemp[tempSel], 0, tempSel ? 110 : 300, &tempDirty[tempSel]); break;
-        case '0': pendTemp[tempSel] = 0; sendTempTarget(tempSel); break;
-        case 'p': applyPreset(); break;
+        case '0':
+            pendTemp[tempSel] = 0;
+            tempDirty[tempSel] = true;
+            requestTempSend(tempSel);   // heater-off mid-print goes through the confirm too
+            break;
+        case 'p':
+            if (mr.st.printState == "printing") {
+                showToast("presets locked while printing", C_WARN, 2500);
+                chirpWarn();
+            } else {
+                applyPreset();
+            }
+            break;
     }
 }
 
@@ -970,20 +1230,24 @@ void handleKeys() {
         }
         if (key == 'h' || key == 'H') { goBack(); continue; }
         // number keys jump between screens from anywhere (except mid-edit;
-        // '0' stays free as the TEMP heater-off key)
-        if (key >= '1' && key <= '6') {
+        // '0' stays free as the TEMP heater-off key). 7 = objects, 8 = cam.
+        if (key >= '1' && key <= '8') {
             switchScreen((Screen)(key - '1'));
             continue;
         }
         // help overlay — everywhere except TEMP, where 0 = heater off
         if (key == '0' && screen != Screen::TEMP) { helpActive = true; continue; }
         switch (screen) {
-            case Screen::DASH:   handleDashKeys(key); break;
-            case Screen::TEMP:   handleTempKeys(key); break;
-            case Screen::MOVE:   handleMoveKeys(key); break;
-            case Screen::FILES:  handleFilesKeys(key); break;
-            case Screen::MACROS: handleMacrosKeys(key); break;
-            case Screen::LOG:    handleLogKeys(key); break;
+            case Screen::DASH:    handleDashKeys(key); break;
+            case Screen::TEMP:    handleTempKeys(key); break;
+            case Screen::MOVE:    handleMoveKeys(key); break;
+            case Screen::FILES:   handleFilesKeys(key); break;
+            case Screen::MACROS:  handleMacrosKeys(key); break;
+            case Screen::LOG:     handleLogKeys(key); break;
+            case Screen::OBJECTS: handleObjectsKeys(key); break;
+            case Screen::WEBCAM:
+                if (key == 'r' && !camStart()) showToast("webcam connect failed", C_ERR, 3000);
+                break;
         }
     }
 
@@ -1020,6 +1284,12 @@ void handleAdjustRepeat() {
         float maxV = tempSel ? 110 : 300;
         pendTemp[tempSel] = constrain(pendTemp[tempSel] + dir, 0.0f, maxV);
         tempDirty[tempSel] = true;
+    } else if (tuneSel == 3) {
+        // Z babystep — 0.005mm per step, accumulated then sent as one
+        // SET_GCODE_OFFSET Z_ADJUST after the debounce window
+        zAdjPending += dir * 0.005f;
+        zDirty = true;
+        lastTuneAdjMs = millis();
     } else {
         float lo = (tuneSel == 2) ? 0 : 10;
         float hi = (tuneSel == 2) ? 100 : 300;
@@ -1087,6 +1357,7 @@ void setup() {
 
     canvas.setColorDepth(16);
     canvas.createSprite(SCR_W, SCR_H);
+    canvas.setTextWrap(false);   // overflow clips cleanly instead of wrap-smearing other rows
 
     M5Cardputer.Speaker.setVolume(128);
 
@@ -1097,10 +1368,10 @@ void setup() {
     splash();
 
     mr.begin(MOONRAKER_HOST, MOONRAKER_PORT);
-    mr.pushLog("[boot] klipputer v1.2", 3);
+    mr.pushLog("[boot] klipputer v1.3", 3);
 
     // first thing a new user needs to know, right on the dashboard
-    showToast("keys 1-6 = screens, 0 = help", C_WARN, 7000);
+    showToast("keys 1-8 = screens, 0 = help", C_WARN, 7000);
 }
 
 void loop() {
@@ -1147,6 +1418,14 @@ void loop() {
         drawLoadingFrame("reading metadata...");
         meta = mr.fetchMeta(detailPath);
     }
+    if (objectsPending && screen == Screen::OBJECTS && WiFi.status() == WL_CONNECTED) {
+        objectsPending = false;
+        drawLoadingFrame("querying objects...");
+        mr.fetchObjects();
+        objSel = objTop = 0;
+    }
+
+    if (screen == Screen::WEBCAM) camLoop();
 
     if (millis() - lastDrawMs >= 50) {
         lastDrawMs = millis();

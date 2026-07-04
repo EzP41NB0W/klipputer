@@ -42,6 +42,11 @@ struct FileMeta {
     String slicer;
 };
 
+struct ObjEntry {
+    String name;
+    float cx = -1, cy = -1;  // center on the bed; -1 if the slicer didn't provide one
+};
+
 class Moonraker {
 public:
     PrinterState st;
@@ -51,6 +56,8 @@ public:
     bool macrosLoaded = false;
     std::vector<FileEntry> files;
     bool filesLoaded = false;
+    std::vector<ObjEntry> objects;   // exclude_object plate map (names + centers)
+    bool objectsLoaded = false;
 
     // console ring — colors: 0 dim (printer output), 1 red (errors),
     // 2 cyan (things we sent), 3 green (connection/info)
@@ -195,6 +202,43 @@ public:
         return ok;
     }
 
+    // Exclude-object plate map. HTTP one-shot with a filter that keeps
+    // only names + centers — object outlines (polygons) can be tens of KB
+    // on a full plate, which this no-PSRAM unit must never parse.
+    bool fetchObjects() {
+        HTTPClient http;
+        http.useHTTP10(true);
+        http.setTimeout(6000);
+        http.begin("http://" + host_ + ":" + String(port_) + "/printer/objects/query?exclude_object");
+        int code = http.GET();
+        bool ok = false;
+        if (code == 200) {
+            JsonDocument filter;
+            JsonObject fex = filter["result"]["status"]["exclude_object"].to<JsonObject>();
+            fex["objects"][0]["name"] = true;
+            fex["objects"][0]["center"] = true;
+            fex["excluded_objects"] = true;
+            fex["current_object"] = true;
+            JsonDocument doc;
+            if (!deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter))) {
+                JsonObjectConst ex = doc["result"]["status"]["exclude_object"];
+                objects.clear();
+                for (JsonObjectConst o : ex["objects"].as<JsonArrayConst>()) {
+                    ObjEntry e;
+                    e.name = o["name"].as<const char *>();
+                    JsonArrayConst c = o["center"];
+                    if (!c.isNull() && c.size() >= 2) { e.cx = c[0]; e.cy = c[1]; }
+                    objects.push_back(e);
+                }
+                st.applyStatus(doc["result"]["status"]);   // current + excluded ride along
+                objectsLoaded = true;
+                ok = true;
+            }
+        }
+        http.end();
+        return ok;
+    }
+
     FileMeta fetchMeta(const String &path) {
         FileMeta m;
         HTTPClient http;
@@ -236,6 +280,7 @@ private:
     uint32_t subId_ = 0, listId_ = 0, infoId_ = 0;
     uint32_t gcodeId_ = 0;
     String gcodeLabel_;
+    bool excludeObjOk_ = true;
 
     bool sendDoc(JsonDocument &d) {
         if (!wsUp) { pushLog("[ws] not connected", 1); return false; }
@@ -280,8 +325,11 @@ private:
         arr("extruder",       {"temperature", "target", "power"});
         arr("heater_bed",     {"temperature", "target", "power"});
         arr("toolhead",       {"position", "homed_axes"});
-        arr("gcode_move",     {"speed_factor", "extrude_factor"});
+        arr("gcode_move",     {"speed_factor", "extrude_factor", "homing_origin"});
         arr("fan",            {"speed"});
+        // current/excluded only — the objects list (with its big polygons)
+        // is fetched over HTTP with a filter instead, never over WS
+        if (excludeObjOk_) arr("exclude_object", {"current_object", "excluded_objects"});
         sendDoc(d);
     }
 
@@ -358,6 +406,14 @@ private:
         if (!doc["error"].isNull()) {
             const char *emsg = doc["error"]["message"] | "unknown";
             pushLog(String("[rpc] err: ") + emsg, 1);
+            // if the subscribe itself failed, retry once without
+            // exclude_object — a printer without [exclude_object] in its
+            // config would otherwise kill the whole subscription
+            if (id == subId_ && excludeObjOk_) {
+                excludeObjOk_ = false;
+                pushLog("[ws] resubscribing without exclude_object", 3);
+                subscribe();
+            }
             if (gcodeBusy && id == gcodeId_) {
                 gcodeBusy = false;
                 evGcodeFail = true;

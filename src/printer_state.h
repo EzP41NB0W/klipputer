@@ -10,6 +10,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <vector>
 
 struct PrinterState {
     // ── klippy (the Klipper host process) ──────────────────────────────
@@ -37,6 +38,15 @@ struct PrinterState {
     float speedFactor = 1.0f;       // gcode_move.speed_factor (1.0 = 100%)
     float extrudeFactor = 1.0f;
     float fanSpeed = 0;             // fan.speed (0..1)
+    float zOffset = 0;              // gcode_move.homing_origin[2] — live babystep offset
+
+    // ── exclude_object ─────────────────────────────────────────────────
+    String currentObject;
+    std::vector<String> excludedObjects;
+    bool isExcluded(const String &n) const {
+        for (const String &e : excludedObjects) if (e == n) return true;
+        return false;
+    }
 
     // ── temp history ring for the graph (1 sample/sec, 2 minutes) ─────
     static const int HIST = 120;
@@ -126,6 +136,19 @@ struct PrinterState {
         if (!o.isNull()) {
             if (o["speed_factor"].is<float>())   speedFactor   = o["speed_factor"];
             if (o["extrude_factor"].is<float>()) extrudeFactor = o["extrude_factor"];
+            JsonArrayConst ho = o["homing_origin"];
+            if (!ho.isNull() && ho.size() >= 3) zOffset = ho[2];
+        }
+
+        o = s["exclude_object"];
+        if (!o.isNull()) {
+            if (o["current_object"].is<const char *>()) currentObject = o["current_object"].as<const char *>();
+            else if (o.containsKey("current_object")) currentObject = "";   // null between objects
+            JsonArrayConst ex = o["excluded_objects"];
+            if (!ex.isNull()) {
+                excludedObjects.clear();
+                for (const char *n : ex) if (n) excludedObjects.push_back(String(n));
+            }
         }
 
         o = s["fan"];

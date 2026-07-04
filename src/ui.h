@@ -166,24 +166,39 @@ inline int drawWrapped(int x, int y, int w, const String &text, uint16_t color, 
 }
 
 // Centered yes/no confirmation box (drawn over the current screen).
+// The detail line word-wraps to two lines instead of truncating.
 inline void drawConfirmBox(const String &l1, const String &l2) {
-    int x = 14, y = 32, w = SCR_W - 28, h = 66;
+    const int CPL = 32;
+    String a = l2, b = "";
+    if ((int)l2.length() > CPL) {
+        int cut = CPL;
+        for (int i = CPL; i > 12; i--) if (l2.charAt(i) == ' ') { cut = i; break; }
+        a = l2.substring(0, cut);
+        b = l2.substring(l2.charAt(cut) == ' ' ? cut + 1 : cut);
+        if ((int)b.length() > CPL) b = b.substring(0, CPL - 2) + "..";
+    }
+    int x = 14, w = SCR_W - 28;
+    int h = b.length() ? 78 : 66;
+    int y = (SCR_H - h) / 2;
     canvas.fillRoundRect(x, y, w, h, 4, C_PANEL);
     canvas.drawRoundRect(x, y, w, h, 4, C_WARN);
     canvas.setTextSize(1);
     canvas.setTextColor(C_WARN);
-    int tw = l1.length() * 6;
-    canvas.setCursor(x + (w - tw) / 2, y + 10);
-    canvas.print(l1);
-    if (l2.length()) {
-        canvas.setTextColor(C_DIM);
-        tw = min((int)l2.length(), (w - 12) / 6) * 6;
-        canvas.setCursor(x + (w - tw) / 2, y + 26);
-        canvas.print(l2.substring(0, (w - 12) / 6));
+    String t1 = l1.substring(0, CPL);
+    canvas.setCursor(x + (w - (int)t1.length() * 6) / 2, y + 10);
+    canvas.print(t1);
+    canvas.setTextColor(C_DIM);
+    if (a.length()) {
+        canvas.setCursor(x + (w - (int)a.length() * 6) / 2, y + 26);
+        canvas.print(a);
+    }
+    if (b.length()) {
+        canvas.setCursor(x + (w - (int)b.length() * 6) / 2, y + 36);
+        canvas.print(b);
     }
     canvas.setTextColor(C_TEXT);
-    canvas.setCursor(x + (w - 21 * 6) / 2, y + h - 16);
-    canvas.print("[ENT]yes   [ESC/h]no");
+    canvas.setCursor(x + (w - 20 * 6) / 2, y + h - 16);
+    canvas.print("[ENT]yes  [ESC/h]no");
 }
 
 // Centered selection-list box (home menu, restart menu).
