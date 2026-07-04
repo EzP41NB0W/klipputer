@@ -222,16 +222,31 @@ void drawToast() {
         int dots = (millis() / 300) % 4;
         for (int i = 0; i < dots; i++) t += '.';
     }
-    if (t.length() > 36) t = t.substring(0, 36);
-    int w = t.length() * 6 + 16;
+    // wrap to two lines at a word boundary instead of truncating
+    String l1 = t, l2 = "";
+    if ((int)t.length() > 36) {
+        int cut = 36;
+        for (int i = 36; i > 16; i--) if (t[i] == ' ') { cut = i; break; }
+        l1 = t.substring(0, cut);
+        l2 = t.substring(t[cut] == ' ' ? cut + 1 : cut);
+        if ((int)l2.length() > 36) l2 = l2.substring(0, 33) + "...";
+    }
+    int wchars = max((int)l1.length(), (int)l2.length());
+    int w = wchars * 6 + 16;
+    int h = l2.length() ? 26 : 16;
     // console keeps its input line at the bottom — toast moves up top there
-    int x = (SCR_W - w) / 2, y = (screen == Screen::LOG) ? 16 : SCR_H - 30;
-    canvas.fillRoundRect(x, y, w, 16, 3, C_PANEL);
-    canvas.drawRoundRect(x, y, w, 16, 3, toastColor);
+    int x = (SCR_W - w) / 2;
+    int y = (screen == Screen::LOG) ? 16 : SCR_H - 14 - h;
+    canvas.fillRoundRect(x, y, w, h, 3, C_PANEL);
+    canvas.drawRoundRect(x, y, w, h, 3, toastColor);
     canvas.setTextSize(1);
     canvas.setTextColor(toastColor);
     canvas.setCursor(x + 8, y + 4);
-    canvas.print(t);
+    canvas.print(l1);
+    if (l2.length()) {
+        canvas.setCursor(x + 8, y + 14);
+        canvas.print(l2);
+    }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -453,7 +468,6 @@ void drawDash() {
         canvas.setCursor(120, 114);
         canvas.printf("BED %.0f/%.0f", mr.st.bedTemp, mr.st.bedTarget);
         drawLegend("[6]console  [1-6]screens  [0]help");
-        canvas.pushSprite(0, 0);
         return;
     }
 
@@ -501,7 +515,6 @@ void drawDash() {
                                                 : "[p]ause [c]ncl [x]stop [;.]sel [,/]adj");
     else
         drawLegend("[4]files start a print  [x]stop  [0]help");
-    canvas.pushSprite(0, 0);
 }
 
 void drawTemp() {
@@ -536,7 +549,6 @@ void drawTemp() {
 
     drawTempGraph(2, 60, 236, 62, mr.st);
     drawLegend("[;.]sel [,/]adj [e]type [ENT]send [0]off");
-    canvas.pushSprite(0, 0);
 }
 
 void drawMove() {
@@ -597,7 +609,6 @@ void drawMove() {
         static const char *items[4] = {"Home ALL", "Home X", "Home Y", "Home Z"};
         drawListMenu("HOME", items, 4, homeSel);
     }
-    canvas.pushSprite(0, 0);
 }
 
 void drawFiles() {
@@ -632,7 +643,6 @@ void drawFiles() {
         canvas.setCursor(74, 110);
         canvas.print("[ENT] PRINT");
         drawLegend("[ESC/h]back");
-        canvas.pushSprite(0, 0);
         return;
     }
 
@@ -660,7 +670,6 @@ void drawFiles() {
         canvas.print(fmtSize(mr.files[idx].sizeB));
     }
     drawLegend("[;.]nav [ENT]open [r]efresh [0]help");
-    canvas.pushSprite(0, 0);
 }
 
 void drawMacros() {
@@ -688,7 +697,6 @@ void drawMacros() {
         canvas.print(name);
     }
     drawLegend("[;.]nav [ENT]run [r]eload [0]help");
-    canvas.pushSprite(0, 0);
 }
 
 void drawLog() {
@@ -743,7 +751,6 @@ void drawLog() {
         static const char *items[2] = {"Firmware restart", "Klipper restart"};
         drawListMenu("RESTART", items, 2, restartSel);
     }
-    canvas.pushSprite(0, 0);
 }
 
 void drawHelp() {
@@ -801,15 +808,17 @@ void drawCurrent() {
         case Screen::MACROS: drawMacros(); break;
         case Screen::LOG:    drawLog(); break;
     }
-    bool toastVisible = millis() < toastUntil;
+    // Overlays composite into the SAME frame, then ONE pushSprite per
+    // frame. v1.2's screens pushed first and overlays pushed a second
+    // frame, so the toast alternated with a toast-less frame every 50ms
+    // tick — that was the rapid flicker reported from hardware.
     if (helpActive) {
         drawHelp();
-        canvas.pushSprite(0, 0);
-    } else if (toastVisible || modal.active) {
-        if (toastVisible && !modal.active) drawToast();
+    } else {
+        if (millis() < toastUntil && !modal.active) drawToast();
         if (modal.active) drawConfirmBox(modal.l1, modal.l2);
-        canvas.pushSprite(0, 0);
     }
+    canvas.pushSprite(0, 0);
 }
 
 // ═══ input ═══════════════════════════════════════════════════════════════
