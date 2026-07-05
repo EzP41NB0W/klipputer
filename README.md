@@ -36,6 +36,14 @@ Number keys **1–6** jump between screens from anywhere.
 | **4 Files** | `;`/`.` navigate · `ENT` details → `ENT` print (confirm) · `r` refresh |
 | **5 Macros** | `;`/`.` navigate · `ENT` run (toast: "running..." with dots → green OK / red FAILED when Klipper actually finishes it) · `r` reload |
 | **6 Console** | `ENT` open command line (type any gcode/macro, `ENT` sends with OK/FAIL feedback, `ESC` exits, `fn+↑` recalls last command, `fn+↓` clears line) · `;`/`.` scroll log · `r` restart menu · `x` E-STOP · `b` speaker test |
+| **7 Objects** | exclude-object plate map: `;`/`.` select · `ENT` exclude (confirm) · `r` refresh — current object green, excluded red X |
+| **8 Webcam** | live MJPEG view from the printer cam · `r` reconnect |
+
+**Safety:** every print-wrecking action asks for confirmation — pause,
+resume, cancel, E-STOP, mid-print temp changes (presets are locked
+outright while printing), and exclude-object. **Z babystep:** while
+printing, the dashboard tune row has a `Z` item — `,`/`/` microsteps the
+gcode offset ±0.005mm (hold to ramp) for dialing in the first layer.
 
 **`0` opens a keymap help overlay from any screen** (except Temps, where
 `0` is heater-off). Top bar tabs show their jump key (1–6). Connection
